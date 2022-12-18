@@ -43,6 +43,8 @@
 #include "transupp.h"		/* Support routines for jpegtran */
 #include "jpegtools.h"
 
+#include "op.h"
+
 /* ---------------------------------------------------------------------- */
 
 /* variables for read_image */
@@ -421,6 +423,25 @@ static void status_error(unsigned char *msg)
     sleep(2);
 }
 
+static void get_exif_coordinates(ExifData *ed, char **longitude, char **latitude) {
+    ExifEntry  *lat, *lat_ref, *lon, *lon_ref;
+    lat_ref = exif_content_get_entry (ed->ifd[EXIF_IFD_GPS], EXIF_TAG_GPS_LATITUDE_REF);
+    lat = exif_content_get_entry (ed->ifd[EXIF_IFD_GPS], EXIF_TAG_GPS_LATITUDE);
+    lon_ref = exif_content_get_entry (ed->ifd[EXIF_IFD_GPS], EXIF_TAG_GPS_LONGITUDE_REF);
+    lon = exif_content_get_entry (ed->ifd[EXIF_IFD_GPS], EXIF_TAG_GPS_LONGITUDE);
+    if (lat == NULL || lat_ref == NULL || lon == NULL || lon_ref == NULL) {
+	*longitude = NULL;
+	*latitude = NULL;
+	return;
+    }
+    *longitude = malloc(25);
+    *latitude = malloc(25);
+    exif_entry_get_value(lon, *longitude, 20);
+    exif_entry_get_value(lat, *latitude, 20);
+    exif_entry_get_value(lon_ref, *longitude + strlen(*longitude), 2);
+    exif_entry_get_value(lat_ref, *latitude + strlen(*latitude), 2);
+}
+
 static void show_exif(struct flist *f)
 {
     static unsigned int tags[] = {
@@ -441,12 +462,13 @@ static void show_exif(struct flist *f)
 	0xa002, // Pixel X Dimension
 	0xa003, // Pixel Y Dimension
     };
+
     ExifData   *ed;
     ExifEntry  *ee;
     unsigned int tag,l1,l2,len,count,i;
-    const char *title[ARRAY_SIZE(tags)];
-    char *value[ARRAY_SIZE(tags)];
-    char *linebuffer[ARRAY_SIZE(tags)];
+    const char *title[ARRAY_SIZE(tags) + 2];
+    char *value[ARRAY_SIZE(tags) + 2];
+    char *linebuffer[ARRAY_SIZE(tags) + 2];
 
     if (!console_visible)
 	return;
@@ -464,6 +486,8 @@ static void show_exif(struct flist *f)
 	ee = exif_content_get_entry (ed->ifd[EXIF_IFD_0], tags[tag]);
 	if (NULL == ee)
 	    ee = exif_content_get_entry (ed->ifd[EXIF_IFD_EXIF], tags[tag]);
+	if (NULL == ee)
+	    ee = exif_content_get_entry (ed->ifd[EXIF_IFD_GPS], tags[tag]);
 	if (NULL == ee) {
 	    title[tag] = NULL;
 	    value[tag] = NULL;
@@ -480,9 +504,24 @@ static void show_exif(struct flist *f)
 	    l2 = len;
     }
 
+    // get gps coordinate values
+    get_exif_coordinates(ed, &value[ARRAY_SIZE(value)-2], &value[ARRAY_SIZE(value)-1]);
+    if (value[ARRAY_SIZE(value)-1] == NULL || value[ARRAY_SIZE(value)-2] == NULL) {
+	title[ARRAY_SIZE(title)-2] = NULL;
+	title[ARRAY_SIZE(title)-1] = NULL;
+    }
+    else {
+	title[ARRAY_SIZE(title)-2] = "Latitude";
+	title[ARRAY_SIZE(title)-1] = "Longitude";
+	if (l1 < 10)
+	    l1 = 10;
+	if (l2 < 18)
+	    l2 = 18;
+    }
+
     /* pass two -- print stuff */
     count = 0;
-    for (tag = 0; tag < ARRAY_SIZE(tags); tag++) {
+    for (tag = 0; tag < ARRAY_SIZE(tags)+2; tag++) {
 	if (NULL == title[tag])
 	    continue;
 	linebuffer[count] = malloc(sizeof(wchar_t)*(l1+l2+8));
@@ -497,7 +536,7 @@ static void show_exif(struct flist *f)
     shadow_render(gfx);
 
     /* pass three -- free data */
-    for (tag = 0; tag < ARRAY_SIZE(tags); tag++)
+    for (tag = 0; tag < ARRAY_SIZE(tags)+2; tag++)
 	if (NULL != value[tag])
 	    free(value[tag]);
     exif_data_unref (ed);
@@ -551,6 +590,67 @@ static void free_image(struct ida_image *img)
 	free(img);
     }
 }
+
+static void auto_rotate_image(struct ida_image **img, char *filename) {
+    struct op_rotate_parm p;
+    struct ida_rect rect;
+    struct ida_image *dest;
+    void *data;
+    unsigned int y;
+
+    struct ida_op operation;
+
+    ExifData *ed;
+    ExifEntry *ee;
+
+    // get EXIF rotation metadata
+    ed = exif_data_new_from_file(filename);
+    if (ed == NULL)
+	return;
+    ee = exif_content_get_entry(ed->ifd[EXIF_IFD_0], EXIF_TAG_ORIENTATION);
+    if (ee == NULL)
+	return;
+
+    switch (exif_get_short(ee->data, EXIF_BYTE_ORDER_INTEL)) {
+    case 3:
+	operation = desc_flip_vert;
+	break;
+    case 5:
+    case 8:
+	operation = desc_rotate_ccw;
+	break;
+    case 6:
+    case 7:
+	operation = desc_rotate_cw;
+	break;
+    default:
+	return;
+    }
+	
+    // rotate image
+    dest = malloc(sizeof(*dest));
+    memset(dest,0,sizeof(*dest));
+    memset(&rect,0,sizeof(rect));
+    memset(&p,0,sizeof(p));
+
+    rect.x1 = 0;
+    rect.y1 = 0;
+    rect.x2 = (*img)->i.width;
+    rect.y2 = (*img)->i.height;
+
+    data = operation.init(*img, &rect, &dest->i, &p);
+    ida_image_alloc(dest);
+    img_mem += dest->i.width * dest->i.height * 3;
+    for (y = 0; y < dest->i.height; y++) {
+        check_console_switch();
+	operation.work(*img, &rect, ida_image_scanline(dest, y), y, data);
+    }
+    operation.done(data);
+
+    free_image(*img);
+    *img = dest;
+}
+
 
 static struct ida_image*
 read_image(char *filename)
@@ -624,6 +724,9 @@ read_image(char *filename)
 	loader->read(ida_image_scanline(img, y), y, data);
     }
     loader->done(data);
+
+    auto_rotate_image(&img, filename);
+    
     return img;
 }
 
