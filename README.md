@@ -30,3 +30,11 @@ ghostscript to render the pdf into a stack of image files for fbi.
 
 Transform jpeg images, like jpegtran, but unlike jpegtran it also
 transforms the exif thumbnail images.
+
+
+------------
+### Fork
+
+This is a fork of fbida to add the following to fbi:
+* automatically rotate images to match the orientation defined in the EXIF metadata
+* add GPS cooridinates to the list of EXIF metadata values shown
